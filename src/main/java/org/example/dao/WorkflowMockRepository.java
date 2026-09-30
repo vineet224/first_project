@@ -14,4 +14,8 @@ public class WorkflowMockRepository {
     public Optional<WorkflowEntity> getWorkflowEntity(String id) {
         return Optional.ofNullable(workflowEntities.get(id));
     }
+
+    public void save(WorkflowEntity workflowEntity) {
+        workflowEntities.put(workflowEntity.getWorkflowId(), workflowEntity);
+    }
 }

@@ -1,22 +1,23 @@
 package org.example.model.entites;
 
-import java.time.LocalDateTime;
-
 import lombok.Data;
+
+import java.time.LocalDateTime;
 
 @Data
 public class UserWorkflowMappingEntity {
 
-    public static enum Status {
-        PENDING,
+    public enum Status{
         COMPLETED,
         DISCARDED,
+        PENDING
     }
 
-    String mobileNo;
     String workflowId;
+    String mobileNo;
     String applicationId;
-    Status status;
-    LocalDateTime createdAt;
     LocalDateTime updatedAt;
+    LocalDateTime createdAt;
+    Status status;
+
 }

@@ -7,5 +7,6 @@ import org.example.dto.WorkflowState;
 public class WorkflowEntity {
     private String workflowId;
     private String userid;
+    private String applicationId;
     private WorkflowState workflowState;
 }
