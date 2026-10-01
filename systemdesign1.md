@@ -13,7 +13,7 @@ Use these evidence labels throughout an interview:
 | Baseline assumption | Redis workflow locking and a VKYC webhook, explicitly assumed for this design |
 | Modeled infrastructure | Relational persistence and operational controls representing the production architecture, rather than the in-memory prototype |
 
-The shared one-step progression service was recently added to this prototype. Describe it as a concrete reconstruction/refinement when discussing historical implementation. The background scheduler, database version checks, durable action ledger, and comprehensive reconciliation policy belong to [design 2](systemdesign2.md).
+The shared one-step progression service was recently added to this prototype. Describe it as a concrete reconstruction/refinement when discussing historical implementation. The background scheduler, database version checks and comprehensive reconciliation policy belong to [design 2](systemdesign2.md). Detailed dispatch ledgers and shared status-read scheduling are optional extensions, not requirements of the confirmed partner state gate.
 
 ### Interview opening
 
@@ -143,6 +143,18 @@ stateDiagram-v2
 | `FAILED` | Retry or correction may be possible, depending on the reason | Generic progression leaves the local state unchanged; detailed classification is proposed in design 2 |
 
 `Application_Rejected` is a vendor state and causes local rejection independently of the vendor status. `FAILED` alone is not equivalent to business rejection.
+
+### Confirmed Vegapay action-acceptance contract
+
+For an application, Vegapay accepts an action while its corresponding workflow state requires that action. `PENDING` means that the action gate is open; successful acceptance moves that state to `IN_PROGRESS` or subsequent progress. Requests targeting a state that has already advanced return an out-of-order exception. This is **state-gated action acceptance**, not an assertion of a request-key deduplication service.
+
+PAN validation takes PAN and DOB and returns a synchronous validation result. Invalid input leaves the partner PAN state pending and local `PAN_VALIDATION` available for corrected or repeated input. Success permits local `PAN_VALIDATION_PENDING`. A different DOB does not need a special idempotency identity to reopen a gate that never closed.
+
+Each synchronization step checks current status before selecting an action. If the same applicable state is still `PENDING`, another call is permitted under the partner contract, provided local prerequisites and the action quota allow it. `IN_PROGRESS` causes no corresponding action call. This contract does not establish webhook ordering or atomic handling of every simultaneous request.
+
+There is a GET/action race: Vegapay can advance after the read but before dispatch. An out-of-order response should cause a bounded fresh status read and reconciliation, not application rejection or immediate replay of the old action. This error-recovery policy is described here as the intended integration behavior; the current progression method does not implement that exception path. It normally performs one status read and at most one action.
+
+The production contract is reported by the user. The mock's simplified responses do not reproduce every gate, transition or out-of-order behavior.
 
 ### Vendor projection and stop boundaries
 
@@ -319,28 +331,44 @@ sequenceDiagram
 
 If the webhook wins first, the frontend sees the newer state under the lock. Duplicate completion after local advancement must not overwrite salary input or generate a limit. The current prototype rejects stale frontend expected-state requests; the client reloads via GET. Design 2 improves the explicit response/reconciliation policy.
 
+Consecutive status reads are accepted in this baseline: if the frontend finishes and a worker in the hybrid extension then acquires the lock, the worker may read Vegapay again. The new observation determines whether work is still required. The lock controls overlap, not polling frequency; `getStatus` has no reported API-specific cap.
+
 A lock prevents overlapping well-behaved owners while its lease is valid. It does not make a remote call plus a local write atomic, or guarantee exactly-once execution after a crash or expired lease.
 
 ## 8. Rate limits, retries and failure semantics
 
-The reported action limit is **five calls per hour per user per action API**. For documentation, model a rolling window; the historical window implementation was not established. Key by stable user/customer identity and action API, not just workflowId. A new workflow must not reset the same user's allowance. Technical retries consume action calls too.
+The reported action limit is **five calls per hour per user per action API**. Model a rolling window; the historical window implementation was not established. Key by stable user/customer identity and action API, not just workflowId. A new workflow must not reset the same user's allowance. Technical retries and corrected inputs consume action calls too.
 
-The vendor status GET has no reported API-specific limit. The baseline can make frequent status reads while a user is on screen, but an actionable `PENDING` response does not authorize unlimited action dispatches. Rate limiting belongs at the common outbound action boundary, so direct input submissions and progression use the same accounting. It is reported production behavior, not implemented quota code in this prototype.
+The vendor status GET has no reported API-specific limit. Frontend pending updates can each obtain a fresh status. Workers add an explicitly paced background trigger in design 2; redundant serialized reads are an accepted primary-design cost. A workflow lock does not throttle reads or replace action admission at the common outbound gateway.
 
-| Situation | Baseline explanation |
+| Situation | Baseline or modeled recovery explanation |
 |---|---|
 | Partner accepts PAN | Transition to pending, then one immediate progression attempt |
-| PAN decline requiring corrected data | Remain at the input boundary; user supplies a new submission subject to the action cap |
-| Vendor `IN_PROGRESS` | Return saved pending state; frontend schedules its next update |
-| Vendor `FAILED` | Failure may be recoverable; generic classified retry machinery is not implemented here |
-| Action quota exhausted | Modeled contract defers the action and exposes waiting/retry information; do not change it into business rejection |
-| Vendor call fails after accepted local input | Resume from stored pending state on a later update; do not require the form again merely to trigger synchronization |
-| Partner succeeded but local completion was not recorded | Outcome is ambiguous; Redis alone cannot prove whether an action can safely be repeated |
-| App closes, callback absent | Local pending state may remain stale until the next foreground update |
+| PAN decline requiring corrected data | Remain at local PAN input and vendor PAN/PENDING; allow correction subject to quota |
+| Applicable vendor state remains PENDING | Call the required action when prerequisites and quota permit |
+| Vendor IN_PROGRESS | Submit no corresponding action; return saved pending state |
+| Vendor FAILED | Classify the reason and partner retry permission; comprehensive retry handling is not implemented here |
+| Action quota exhausted | Defer the action; do not turn quota exhaustion into business rejection |
+| Action response lost, partner still at the applicable PENDING gate | A fresh status check permits a retry subject to quota; no request-key mechanism is assumed |
+| Action response lost, partner is IN_PROGRESS or further ahead | Use current progress to reconcile; do not replay an obsolete action |
+| Out-of-order action response | Bounded fresh status reconciliation; no automatic rejection or immediate old-action replay |
+| Response-derived artifact missing | Retrieve it through the partner's recovery/read API, persist it, then expose the next local state |
+| Partner ahead, required user input absent | Preserve local state and record divergence; never invent input |
+| App closes, callback absent | Local state may remain stale until the next foreground update |
 
-The user-described corrected PAN retry is a business correction flow. It is distinct from repeating an identical request after a network timeout. The repository's declined branch and payload model illustrate the boundary, not a complete production error-response/retry implementation.
+### Lost-response reconciliation
 
-The one extra step trades slightly longer submission latency for sometimes avoiding another frontend round trip. It does not wait until an hours-long VKYC process finishes. A failure in this extra step should not undo an already durable accepted input in the production design; whether to return a pending response or an error is an explicit transport policy, not a guarantee of the current code's exception behavior.
+Reconciliation uses **current vendor evidence, saved prerequisites and required screen artifacts**. Saved input proves that the prerequisites exist; it does not prove a call was sent or accepted. A compatible later partner state supplies progress evidence according to the partner transition contract.
+
+For example, both addresses were saved and local state is `EKYC_PENDING`. The permanent-address action succeeds but its response is lost. If the next GET requests current address, submit that saved current address and remain `EKYC_PENDING`. Vendor microstate progress does not imply that EKYC is complete. Enter `VKYC` only after the appropriate boundary is confirmed and its URL is available in the document store.
+
+If a lost response contained data required locally, retrieve that data before transitioning. The existing client exposes getters such as `getLimit`; the user also describes partner address/read recovery APIs. These recovery capabilities are contract context, not a claim that every getter or generic catch-up path is implemented in the prototype. Recovery reads obey their applicable API allowances. If an artifact fetch fails, preserve the waiting local state and try later.
+
+If local PAN input was saved but the synchronous success response was lost, a current vendor read showing confirmed PAN processing/progression can establish that the submitted PAN was accepted. Local catch-up must use the saved submission and verified milestone; the current prototype's input-free update does not yet implement this generalized PAN recovery.
+
+The user-described PAN correction flow differs from transport recovery. A synchronous invalid result leaves the input gate open; a lost result requires current-status checking before deciding whether another action is appropriate. No speculative `PAN_VALIDATION_PENDING -> PAN_VALIDATION` transition is added.
+
+The one extra progression step trades additional submission latency for sometimes avoiding another frontend round trip. It does not wait for an hours-long VKYC process. Failure in that step must not undo durable accepted input in the production design. Pending/error response policy and comprehensive lost-response reconciliation remain distinct from the current code's exception behavior.
 
 ## 9. Data handling and operations
 
@@ -366,18 +394,21 @@ The complexity to emphasize is the coordination of two state machines, accepted-
 
 Answer each prompt aloud before reading its checkpoint.
 
-1. **?The frontend calls an API. Where is the backend orchestration??** Explain that the trigger does not select arbitrary vendor actions. Show persisted input, stage-scoped action selection, the stop boundary, permitted transitions and artifact hydration.
-2. **?Why not return immediately after saving input??** Explain the one-step opportunity, bounded work, the extra latency and continuation from pending if unfinished.
-3. **?Does a single step mean a single HTTP request to the bank??** No. Progression has one status read and at most one action; the input handler can already have its own vendor calls.
-4. **?Vegapay says Limit_Generate/PENDING. Why don't you generate the limit??** Readiness requests an action, but local salary prerequisites are absent. Advance to `LIMIT_CREATION` and stop for input.
-5. **?Two frontend calls and a webhook arrive together. Who wins??** Same workflow lock, reread under ownership, apply only an eligible transition; stale frontend reloads, duplicate callback becomes a no-op.
-6. **?You took a Redis lock. Does that guarantee exactly-once partner calls??** Explain lease expiry and crash after partner acceptance. A lock alone cannot resolve the remote outcome.
-7. **?What happens when the user closes the app??** Callback may advance VKYC; otherwise local freshness waits for return. Explain this baseline limitation directly.
-8. **?Does FAILED mean the application is rejected??** No. Distinguish recoverable vendor failure from `Application_Rejected` and from corrected PAN input.
-9. **?Why are there separate states on your side??** Stable screen/input semantics consolidate vendor microstates; the backend owns a projection rather than copying the vendor enum.
-10. **?How is the five-call limit scoped??** Per stable user and action API over the modeled hour window, shared across input and progression. Status reads are separate.
-11. **?What if the vendor skipped your expected state??** Baseline exact-boundary logic does not implement comprehensive recovery. Describe the compatibility/reconciliation extension in design 2 without claiming it was already deployed.
-12. **?What evidence can this prototype demonstrate??** Explain the six existing behavior tests and source paths below; distinguish mock-state persistence from production durability.
+1. **"The frontend calls an API. Where is backend orchestration?"** Show persisted prerequisites, stage-scoped vendor actions, stop boundaries, permitted transitions and artifact hydration. The trigger is not the owner of the workflow.
+2. **"Why run another step after accepting input?"** Explain the immediate progression opportunity, bounded work, extra latency and continuation from pending if unfinished.
+3. **"Does one step mean one bank HTTP call for the whole submission?"** No. Progression has one read and at most one action; input handlers can have their own calls. The modeled out-of-order recovery adds a bounded read, not an unlimited loop.
+4. **"Limit_Generate/PENDING requests an action. Why stop?"** Salary is still required. Move to local LIMIT_CREATION and stop for input.
+5. **"Two frontend updates and a webhook arrive together. Who wins?"** Same workflow lock, reread, eligible transition. Stale frontend reloads; duplicate completion is a no-op.
+6. **"Does the lock prevent a worker reading status right after the frontend?"** No. Serialized redundant reads are accepted. The lock prevents overlap; worker cadence controls background frequency.
+7. **"An action response was lost. Can you retry?"** GET first. Same compatible PENDING permits a quota-limited retry; IN_PROGRESS/later progress permits waiting or local catch-up. Previous-stage requests return out-of-order.
+8. **"What is Vegapay's idempotency mechanism here?"** Describe its application state gate and obsolete-stage rejection. Do not invent cached request-key responses or claim simultaneous-request atomicity was established.
+9. **"How can corrected DOB work with the same applicationId?"** Invalid synchronous PAN validation leaves the gate open. Valid PAN moves it forward; old-stage submissions are then rejected.
+10. **"Does stored address input prove submission succeeded?"** No. It proves prerequisites. Current compatible partner progress supplies completion evidence.
+11. **"What if your workflow missed an intermediate observation?"** Use stored prerequisites and compatible current vendor evidence. Hydrate missing response data before local transition. Generalized catch-up is an extension to the prototype's exact-boundary logic.
+12. **"The partner is ahead but salary was never supplied. Jump forward?"** No. Record divergence and preserve the user boundary.
+13. **"Does FAILED mean rejected?"** No. Use the reason and supported retry policy. Application_Rejected is a separate business outcome.
+14. **"How is the five-call limit scoped?"** Stable user plus action API over the modeled hour, shared across submissions and progression. Status reads are separate.
+15. **"What can this prototype demonstrate?"** The six behavior tests and current source paths below. Distinguish implemented one-step logic, mock persistence, assumed locks/webhook and proposed recovery.
 
 ## 12. Validation and source map
 

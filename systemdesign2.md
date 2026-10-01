@@ -8,9 +8,9 @@ The baseline code still provides the domain foundation: input handlers, typed do
 
 ### Interview opening
 
-> The core problem was reconciling our resumable onboarding state with an asynchronous bank workflow. In the baseline, foreground updates and a VKYC callback triggered that process. My proposed extension gives recently active applications a scheduled reconciliation path, while keeping all triggers behind one state policy, one scheduling decision and shared action limits. It also specifies stale-observation handling, crash recovery and classified retries.
+> The core problem was reconciling our resumable onboarding state with an asynchronous bank workflow. In the baseline, foreground updates and a VKYC callback triggered that process. My proposed extension gives recently active applications a scheduled reconciliation path, while keeping all triggers behind one state policy and shared action limits. It also specifies stale-observation handling, crash recovery and classified retries.
 
-Use ?implemented,? ?assumed baseline,? and ?proposed extension? precisely. The sophistication comes from clear ownership and failure semantics; it does not require describing a proposed feature as historical experience.
+Use "implemented," "assumed baseline," and "proposed extension" precisely. The sophistication comes from clear ownership and failure semantics; it does not require describing a proposed feature as historical experience.
 
 ## 2. Requirements and chosen policies
 
@@ -48,13 +48,15 @@ The reported identity rule is one stable customer identity per mobile number, hi
 | Mutation lock | Same deterministic Redis workflowId key for every trigger | User-confirmed assumption |
 | Inactive recovery | Webhook or next foreground visit; no routine inactive polling | User-confirmed choice |
 | Work queue | Durable due-job table and scheduled workers | Proposed prototype-friendly implementation |
-| Partner idempotency/event ordering | Not established by the supplied contract | Do not assume guarantees |
+| Action acceptance | Current application/state gates the action; obsolete-state calls return out-of-order | User-confirmed partner contract |
+| Request-key deduplication / event ordering | Not established by that state gate | Do not assume separate guarantees |
+| Status-read coalescing / attempt ledger | Optional traffic and audit tooling | Not required by the primary design |
 
 An active user is not necessarily on screen now. A user who closed the app eleven hours ago is still active under this policy. That is intentional and must be included in the polling cost discussion.
 
 ### Correctness and liveness goals
 
-Persist accepted input before relying on later synchronization; apply only permitted local transitions; prepare screen artifacts before exposing the next screen; prevent concurrent local overwrites; avoid known duplicate external actions; honor the action cap across all drivers.
+Persist accepted input before relying on later synchronization; apply only permitted local transitions; prepare screen artifacts before exposing the next screen; prevent concurrent local overwrites; avoid replaying actions for states already advanced; honor the action cap across all drivers.
 
 Background freshness is conditional on active eligibility, partner availability, scheduling and quotas. There is no unconditional freshness guarantee for an inactive application whose webhook never arrives. Returning users initiate reconciliation even after the activity window expires.
 
@@ -71,7 +73,7 @@ flowchart TD
     Coordinator[Shared sync coordinator]
     Policy[Stage and reconciliation policy]
     Redis[Redis: workflow lock and shared action quota]
-    DB[(Workflow / documents / attempts / jobs / audit)]
+    DB[(Workflow / documents / jobs / audit)]
     Client[Vendor gateway]
     Vegapay[Vegapay and bank processing]
     App --> API
@@ -99,7 +101,6 @@ stateDiagram-v2
     [*] --> PAN_VALIDATION
     PAN_VALIDATION --> PAN_VALIDATION_PENDING: PAN accepted
     PAN_VALIDATION_PENDING --> EKYC: URL persisted
-    PAN_VALIDATION_PENDING --> PAN_VALIDATION: Confirmed user-correctable PAN failure
     EKYC --> EKYC_PENDING: Input persisted
     EKYC_PENDING --> VKYC: VKYC URL persisted
     VKYC --> VKYC_PENDING: Session reference persisted
@@ -109,7 +110,7 @@ stateDiagram-v2
     OFFER_GENERATED --> [*]
 ```
 
-Rejection is an explicit terminal business outcome available during an ongoing application. Recovery status is additional metadata. The one backward edge shown is a narrowly guarded PAN correction policy; undocumented partner recovery does not authorize arbitrary reversal of the journey.
+Rejection is an explicit terminal business outcome available during an ongoing application. Recovery status is additional metadata. Invalid PAN input is rejected synchronously and leaves the input state open, so no backward PAN recovery edge is needed. Undocumented partner recovery does not authorize arbitrary reversal of the journey.
 
 | Local stage | Vendor enum / work | Completion boundary |
 |---|---|---|
@@ -130,209 +131,225 @@ A stop boundary is a predicate over local prerequisites, current vendor evidence
 
 | Status | Coordinator decision |
 |---|---|
-| `PENDING` / code `PNEDING` | Select the action for this vendor state, then check local stage, prerequisites, attempt identity and quota before dispatch |
+| `PENDING` / code `PNEDING` | Select the compatible current-state action, check stored prerequisites and quota, then dispatch; a repeated applicable pending gate permits another call |
 | `IN_PROGRESS` | Submit no corresponding action; persist observation and schedule a later check |
 | `FAILED` | Classify error/failed action; choose technical retry, user correction, explicit recovery or investigation |
 | State `Application_Rejected` | Confirm the business outcome and apply local rejection; stop normal jobs |
 
 Hours in VKYC processing can be normal according to the supplied experience. The stage age alone is not grounds for rejecting the application. `RE_Ekyc_Verification` is a specific recovery signal, not something to discard using a numerical state rank.
 
+### Confirmed state-gated action acceptance
+
+Vegapay accepts the corresponding action while the application is at its actionable pending state. Successful acceptance moves that state to IN_PROGRESS or later progress. Once it has advanced, a previous-state call returns an out-of-order exception. The gate, not a presumed request-key cache, is the action-acceptance mechanism described by the user.
+
+PAN/DOB validation returns synchronously. An invalid attempt leaves vendor PAN/PENDING and local PAN_VALIDATION open to another corrected or repeated attempt. Success permits the local pending state. A lost success response is recovered by checking current partner progress against the saved submission, not by reopening the form through a speculative backward edge.
+
+The gate does not establish webhook delivery ordering or atomicity of every simultaneous request. The backend still serializes its own drivers and respects action quotas. The mock responses are simplified and do not implement every production gate/error path.
+
 ## 5. Low-level responsibilities and interfaces
 
-Existing prototype roles remain recognizable:
+Keep the existing code's roles, with the shared coordinator extending its stage-bounded progression policy:
 
 | Component | Responsibility in the proposed design |
 |---|---|
-| `WorkflowOrchestrator` | Authenticate/resolve workflow, accept input, request immediate progression, build latest response |
-| `WorkflowStateHandlers` | Typed input handling and durable local acceptance; preserve PAN's acceptance-before-pending exception |
-| `VegapayProgressionService` | Foundation for the one-observation, stage-bounded decision |
-| `WorkflowTransitionService` / proposed `RecoveryTransitionPolicy` | Normal domain edges plus the separately guarded PAN correction edge |
-| `VegapayStateHandler` | Vendor action/artifact adapters; policy stays outside the transport |
-| `WorkflowResponseBuilder` | Render a committed local state with stored screen data |
-| `SyncCoordinator`, proposed | Common ownership, observation, recovery, action and transition application for all drivers |
-| `ActivityTracker`, proposed | Atomically refresh activity using authenticated foreground calls only |
-| `SyncJobRepository` and scheduler, proposed | Deduplicated due jobs, leases, retry/rescheduling and stale-job rejection |
-| `ReconciliationPolicy`, proposed | Local/vendor compatibility, user prerequisites and artifact requirements |
-| `ActionAttemptRepository` and quota gateway, proposed | Attempt identity, ambiguity and shared dispatch limits |
-| `WebhookInbox`, proposed | Durable receipt, authentication outcome, deduplication and processing status |
+| WorkflowOrchestrator | Resolve ownership, validate input, request one immediate progression after acceptance and build the latest response |
+| WorkflowStateHandlers | Persist typed input and apply stage-specific acceptance, including synchronous PAN validation |
+| VegapayProgressionService | Foundation for one status read and a compatible action or boundary transition |
+| WorkflowTransitionService | Explicit allowed local edges; no arbitrary jumps across user boundaries |
+| VegapayStateHandler / VegapayClient | Vendor actions, artifact retrieval and transport adapters |
+| WorkflowResponseBuilder | Render committed local state using saved screen artifacts |
+| SyncCoordinator, proposed | Shared fresh-status decision and reconciliation for frontend, worker and webhook |
+| ReconciliationPolicy, proposed | Compatibility, prerequisite and required-artifact predicates |
+| ActivityTracker, proposed | Authenticated foreground timestamps and 12-hour eligibility |
+| Due-job scheduler/repository, proposed | Background cadence, one current job per workflow, claims and stale-job rejection |
+| Action quota gateway, proposed | Shared per-user/API admission before every applicable action dispatch |
+| WebhookInbox, proposed | Authenticated durable receipt and recoverable processing |
+| Optional audit/dispatch recorder | Diagnostics and retry accounting; not an override of an authoritative pending gate |
 
-Illustrative interfaces, not implemented code:
+Illustrative interfaces; no runtime API changes are made here:
 
 ```java
 enum SyncTrigger { FRONTEND_UPDATE, WORKER, WEBHOOK }
-
 enum SyncOutcome {
-    ADVANCED, ACTION_ACCEPTED, WAITING, DEFERRED,
+    ADVANCED, ACTION_SUBMITTED, WAITING, QUOTA_DEFERRED,
     NEEDS_USER_CORRECTION, NEEDS_RECONCILIATION, TERMINAL
 }
 
 SyncResult synchronize(String workflowId, SyncTrigger trigger,
                        Optional<WebhookReceipt> receipt);
-
-Decision decide(WorkflowSnapshot local, VendorObservation observed,
-                Optional<ActionAttempt> currentAttempt);
-
+Decision decide(WorkflowSnapshot local, VendorObservation observed);
 QuotaDecision reserveAction(String customerId, String actionApi,
                             String dispatchAttemptId);
-void schedule(String workflowId, WorkflowState expectedState,
-              long scheduleGeneration, Instant dueAt);
+void scheduleBackground(String workflowId, WorkflowState expectedState,
+                        long jobGeneration, Instant dueAt);
 ```
 
-These separate observation from the decision to dispatch a side effect. A status read should not bypass the action ledger merely because it returned `PENDING`.
+`dispatchAttemptId` identifies one admission/dispatch attempt. Retrying admission for that same attempt need not count twice, while a new outbound retry consumes another slot. This requires atomic quota bookkeeping, not a mandatory business-operation state machine.
+
+The coordinator makes decisions from current vendor state and saved local prerequisites. An optional ACCEPTED/UNKNOWN marker must not automatically prohibit another action that a fresh applicable PENDING gate permits under the reported contract.
 
 ## 6. Persistence and invariants
 
-The mock repositories are replaced by relational persistence in this proposed design. This is a logical schema, not a migration supplied with this document.
+Relational persistence replaces the prototype's in-process repositories in this proposed architecture. This is a logical schema, not a migration.
 
 | Record | Important fields and constraints |
 |---|---|
-| Customer/application mapping | stable customer_id, general_workflow_id, bank workflow_id, application_id; enforce the reported one-eligible-active-journey rule |
-| Workflow | workflow_id, customer_id, application_id, local_state, version, last_vendor_state/status, last_observed_at, recovery_status, updated_at |
-| Step document | workflow_id, state_name, payload_json, payload_revision; unique current document per workflow/state |
-| Activity | workflow_id, last_foreground_at, active_until, resume_requested_at, resume_processed_at; use maximum timestamps so older requests cannot shorten the lease |
-| Sync metadata | workflow_id, next_sync_at, unchanged_count, status_error_count, schedule_generation |
-| Due job | workflow_id primary key, expected_state, schedule_generation, due_at, job_lease_until, claim_token |
-| Action operation | operation_id, workflow_id, action_api, payload_revision, stage_generation, input_hash, status, vendor_reference, result_reference; unique logical operation identity |
-| Action dispatch attempt | dispatch_attempt_id, operation_id, attempt_number, reserved_at, sent_at, outcome, retry_at, error_class; unique operation/attempt number |
-| Webhook receipt | provider_event_id when available, application_id, received_at, payload_reference, processing_status; unique provider event identity when trustworthy |
-| Audit | workflow/version, trigger, observation reference, old/new state, operation reference, timestamps and reason |
+| Customer/application mapping | customer_id, general_workflow_id, workflow_id, application_id; enforce the reported eligible-active-journey rule |
+| Workflow | workflow_id, customer_id, application_id, local_state, version, last_vendor_state/status, last_observed_at, recovery_status |
+| Step document | workflow_id, state_name, typed payload_json, payload_revision; current document plus retained revision/audit references |
+| Activity | workflow_id, last_foreground_at, active_until; atomic maximum timestamp update |
+| Background job | workflow_id primary key, expected_state, job_generation, due_at, unchanged_count, lease_until, claim_token |
+| Retry metadata | workflow_id, action_api, payload_revision, attempts, retry_at, error_class; bounded accounting where technical retries are used |
+| Webhook receipt | provider event ID if trustworthy, application_id, received_at, payload_reference, processing_status |
+| Audit | workflow/version, trigger, observed partner state/status, old/new local state, input revision and reason |
+| Optional dispatch detail | dispatchAttemptId, action, timestamps, response reference and outcome; diagnostic support |
 
-Use an index on due time for queue selection and indexes on vendor application mapping and receipt processing status. Capacity and retention are configuration choices, not undocumented production metrics.
+Index background due time, vendor application mapping and unprocessed receipts. A full accepted/in-flight/unknown operation ledger is optional; it is not needed to implement the state-gated primary path. Shared nextSyncAt and resume markers are optional metadata described later.
 
 Invariants:
 
-1. A committed next-screen state has the artifacts that its response requires.
-2. A local transition is based on the currently reread state and expected version.
-3. All dispatches share the user/action quota, including corrected inputs and technical retries.
-4. An accepted/in-flight/unknown operation is not blindly recreated by the next poll.
-5. Worker execution and webhook delivery never refresh foreground activity.
-6. A job never supplies missing user input or advances a completed journey through an old stage.
-7. A durable receipt remains processable after an ingress acknowledgment.
+1. A next-screen state is committed only with its required artifacts.
+2. Local input exists before an action requiring it is dispatched.
+3. Saved input proves prerequisites, not successful vendor execution; current compatible vendor evidence establishes progress.
+4. Business-state writes use the reread local state and version.
+5. All drivers share the stable-user/action API allowance.
+6. Workers and callbacks do not renew the foreground activity lease.
+7. Missing required input or an unsupported mismatch stops automatic advancement.
+8. A successful webhook acknowledgment follows durable receipt or durable application.
 
-Persist related document changes, workflow transition, audit and due-job updates in one local transaction where they form one committed result. The external vendor call is outside that local atomic boundary.
+Commit related documents, local transition, audit and background-job updates transactionally. The vendor call is outside that transaction. Database version checks and shared locks protect local coordination; partner acceptance is governed by the reported vendor state contract.
 
 ## 7. API behavior and submission flow
 
-The logical public operations remain create, GET status and UPDATE status. No runtime API is changed by writing this document. If implemented, retain existing response fields and add optional synchronization metadata such as `lastSyncedAt`, `retryAfterSeconds`, `recoveryStatus` and an actionable reason. These are proposed fields, not current DTO contents.
+Keep logical create, GET status and UPDATE status operations. GET returns persisted workflow/screen data and atomically refreshes activity; it does not call Vegapay or change business state. UPDATE processes input or triggers synchronization. Ownership comes from the server's customer/application mapping.
 
-GET returns local state, refreshes activity and records a resume request; it does not itself mutate the business state or call Vegapay. Its metadata write need not take the business workflow lock if performed atomically. UPDATE may accept input or request reconciliation. Both enforce ownership using the server mapping.
+If later implemented, optional `lastSyncedAt`, `retryAfterSeconds` and recovery reason fields can supplement the existing response DTO. These are proposed interface additions, not current fields.
 
-For a stale pending request without input, return the current state and artifacts rather than replaying the old stage. For a stale input submission, return a conflict plus the current journey; do not reinterpret its payload as input to a different stage. Repeated submission of the same previously accepted request can return its stored result when an input idempotency identity is available.
+For stale input-free pending requests, return/reconcile from current local state. For stale input, report conflict with the current journey; never interpret an old payload as another stage's input.
 
-### One progression step after input remains
+### Input and immediate progression
 
 ```text
-Authenticate and resolve workflow
 Acquire shared workflow lock; reread local state/version
-Validate expected input state and typed payload
-Accept/save input according to stage policy
-    PAN: transition only after explicit partner acceptance
-    Limit: preserve the required partner-action acceptance policy
-    Other input stages: save prerequisites and transition to pending
-Commit accepted pending state and input revision
-Request one immediate progression step using the resulting pending stage
-Build response from the latest committed local state
-Release owned lock
+Obtain current partner status for the state-dependent decision
+Reconcile verified existing partner progress before resubmitting old input
+Validate the expected input state and typed payload
+Persist the submitted prerequisites
+    PAN: call synchronous validation only at its applicable gate
+         invalid -> remain at input; success -> enter local pending
+    Limit: preserve stage-specific action acceptance
+    Other input stages: save input and enter pending
+Commit accepted local input/state
+Run one immediate progression opportunity for the resulting pending stage
+Build latest committed workflow response
+Release the owned lock in finally
 ```
 
-The immediate progression request gets one due check after a new pending stage is committed; it still respects action quota and known operation state. It does not initiate an unbounded polling loop. A failure after accepted input preserves that acceptance and returns a pending/recovery response in the proposed transport policy, while unexpected programming errors remain errors.
+The post-submission progression opportunity normally reads partner status once and performs at most one permitted action. Input handlers can already have their own vendor interactions, so the full HTTP request can contain more calls. A modeled out-of-order recovery can add one bounded read; it never becomes an unlimited loop.
 
-This preserves the decisive [current orchestration behavior](src/main/java/org/example/service/WorkflowOrchestrator.java): input dispatch is followed by `pollVegapay(...)`, then response construction. A background job is an additional trigger, not a replacement for frontend updates.
+The [current orchestrator](src/main/java/org/example/service/WorkflowOrchestrator.java) already demonstrates input dispatch followed by progression and response construction. The assumed lock, generalized recovery-before-resubmission and out-of-order exception policy are broader integration behavior or proposed extensions, not a claim that all are in that method.
 
-## 8. Shared scheduling and active-user polling
+If PAN input was saved and its success response was lost, current vendor PAN processing/later progress plus the saved submission can justify catch-up to PAN_VALIDATION_PENDING and the next verified boundary. Do not call PAN again at an obsolete gate. The prototype's input-free input-state update currently does not implement this catch-up; the proposed shared recovery path can do so. Routine worker scope remains EKYC/VKYC.
+
+A failed extra progression step preserves durable accepted input and returns pending/recovery information under the proposed response policy. It must not ask for the form again solely to trigger synchronization.
+
+## 8. Active-user workers and polling frequency
 
 ### Eligibility
 
 ```text
 activeUntil = most recent authenticated GET/UPDATE time + 12 hours
-eligible = localState in {EKYC_PENDING, VKYC_PENDING}
-           and now < activeUntil
-           and workflow is not terminal
-           and no blocking user-correction/investigation condition
+eligibleBackground = localState in {EKYC_PENDING, VKYC_PENDING}
+                     and now < activeUntil
+                     and not terminal
+                     and not blocked by missing input/investigation
 ```
 
-Use the existing UI convention that GET runs on screen entry and UPDATE runs for subsequent polling. GET atomically sets `resume_requested_at` to the current time. The next coordinator call consumes that request once under the workflow lock, recording `resume_processed_at`; the worker may consume it too. This permits a fresh check on a return within the same 12-hour activity lease, rather than only after lease expiry. Multiple entry requests within 30 seconds of an observation coalesce into one deferred check. If a pending application becomes active again, GET and the next UPDATE also recreate any suspended due job.
+GET/UPDATE renew foreground activity. Worker execution and callbacks never renew it. After twelve hours without user requests, routine worker polling stops; callback delivery or returning frontend synchronization still works. A returning pending workflow recreates its background job if needed.
 
-A consumed resume request resets observation backoff for freshness, but not action-attempt identities, quota, technical retry deadlines or a recorded ambiguity. Routine three-second UPDATE calls refresh activity without creating resume requests or resetting backoff. Until a foreground update consumes the request, GET can return the previously saved state.
+### Primary policy: fresh status per admitted trigger
 
-### Due-time defaults
+After acquiring the workflow lock and rereading local eligibility, an admitted frontend or worker synchronization fetches current Vegapay status. A worker waiting behind a frontend may make another GET immediately after obtaining ownership. This is accepted overhead: no specific status-API quota was reported. That read determines whether the worker should act, wait or reconcile.
 
-| Stage/condition | Proposed configurable schedule |
+The lock controls overlap, not frequency. It does not suppress sequential reads or replace the action quota. Routine frontend updates retain their roughly three-second cadence; terminal/stale/noneligible work can no-op without an unnecessary vendor call.
+
+A webhook requests current-status reconciliation under the same lock when the event cannot be established as a completed/stale no-op. The primary path does not reuse a mandatory recent-status cache.
+
+### Background cadence defaults
+
+| Condition | Proposed configurable worker schedule |
 |---|---|
-| Newly entered pending stage | One immediate foreground progression opportunity |
-| EKYC unchanged/processing | 30 s, 60 s, then 120 s maximum |
-| VKYC unchanged/processing | 5 min, 10 min, 20 min, then 30 min maximum |
-| Meaningful stage/vendor progress | Reset unchanged backoff; schedule the next permitted step |
-| Foreground resume | Request a fresh check; coalesce if another observation occurred in the last 30 s |
-| Technical failure | Classified retry deadline, capped attempt budget and backoff |
-| Quota defer | Earliest permitted action time; avoid repeated status reads merely to rediscover the same quota block |
-| Lease expiry or next input state | Remove/suspend routine worker job |
+| Newly eligible EKYC/VKYC stage | Foreground gets its immediate progression opportunity; create subsequent due work |
+| EKYC unchanged/processing | 30 seconds, 60 seconds, then 120 seconds maximum |
+| VKYC unchanged/processing | 5 minutes, 10 minutes, 20 minutes, then 30 minutes maximum |
+| Meaningful vendor progress / accepted intermediate action | Reset background backoff and schedule verification/next work |
+| Failed status read | Technical backoff; do not submit an action using an unavailable fresh observation |
+| Quota defer | Defer the action until permitted; do not repeatedly dispatch merely because a job is due |
+| Expired activity / next user-input state | Remove or suspend routine background work |
 
-Use approximately +/-20% jitter for routine background checks. Do not jitter a quota or Retry-After deadline earlier. The cadence is a chosen design default, not a claim about measured vendor performance.
+Use roughly +/-20% jitter for routine worker checks. Never move a quota or partner retry deadline earlier. Foreground updates do not need to wait for a worker due time. They can fetch status even when an action is temporarily deferred; every attempted action still checks its quota/retry eligibility.
 
-The coordinator evaluates shared `nextSyncAt` under the lock. Frontend and worker use the same due decision. A new stage or actual foreground resume can request an earlier check once; normal screen refresh cannot repeatedly force it. A webhook can request reconciliation immediately because it supplies a new event, but repeated equivalent webhook work is coalesced too.
+### Durable job execution
 
-A recently completed observation wins even if the worker job is already queued. The second caller rereads due metadata and returns saved state. This avoids turning two drivers into two independent streams of status calls.
+1. Claim a due row using a short database lease and unique token.
+2. Acquire the workflow lock or defer; no action slot is consumed while waiting.
+3. Reread state, twelve-hour activity, recovery status and job generation.
+4. Drop stale/ineligible work, then perform one bounded fresh-status step.
+5. Commit results and the replacement/cancellation of the background job.
+6. Complete only the claimed generation/token so an old worker cannot delete newer work.
 
-### Durable worker execution
+Worker due time controls background pacing only. `job_generation` identifies the scheduling decision and is distinct from the workflow version. If the process dies, job-lease expiry permits reclamation; the next execution rereads all eligibility and partner evidence.
 
-1. Claim a due row using a database lease and unique claim token.
-2. Attempt the workflow lock; defer on contention without consuming an action quota slot.
-3. Reread local stage, activity, recovery status, due time and schedule generation.
-4. Drop work for expired activity, noneligible stage or stale generation; reschedule work that is no longer due.
-5. Run one synchronization step; persist its result and next due job transactionally.
-6. Complete/reschedule only the claimed generation/token, so a stale completion cannot delete a newer job.
+A durable database due-job queue is sufficient for the prototype. With a broker later, use an outbox for transactional scheduling and retain consumer deduplication. Do not hold the workflow lock while sleeping for backoff.
 
-The `version` protects workflow commits. `schedule_generation` identifies the current scheduling decision without making a job obsolete on every activity timestamp update. A process crash allows job-lease expiry and reclamation; repeated execution uses the same state/action policy.
+## 9. Shared synchronization algorithm and local concurrency
 
-With a broker later, commit a scheduling outbox alongside the local state, publish asynchronously and preserve the same consumer deduplication. The v1 database queue avoids introducing a DB/broker dual-write problem.
-
-## 9. Coordinator algorithm and concurrency
-
-Conceptual one-step pseudocode:
+Conceptual primary algorithm; it specifies proposed recovery beyond the current one-step code:
 
 ```text
 synchronize(workflowId, trigger, receipt):
     acquire owned workflow lock with bounded wait
-    reread workflow, metadata and applicable operation
-    validate trigger eligibility
-    if terminal/stale:
-        finish any webhook receipt durably as no-op; return saved state
-    consume any pending entry/resume request with 30-second coalescing
-    if normal frontend/worker observation is not due: return saved state
+    try:
+        reread local workflow, documents, version and trigger eligibility
+        if terminal, already-completed webhook or stale/ineligible worker:
+            finish receipt/job as durable no-op where applicable
+            return latest local response
 
-    for unversioned webhook: use it as a wake-up hint
-    obtain current authenticated vendor status when needed
-    decide compatibility, required prerequisites and permitted action
+        observed = GET current Vegapay status
+        decision = reconcile(local, prerequisites, observed)
+        if required input missing or mismatch unsupported:
+            record divergence; return saved state
+        if partner rejection confirmed:
+            commit local rejection and cancel work
+        else if local milestone catch-up / screen preparation is possible:
+            fetch missing response artifacts through permitted recovery APIs
+            commit artifacts + allowed transition + audit + job update
+        else if applicable action gate is PENDING and prerequisites exist:
+            check retry eligibility and shared action quota
+            if admitted:
+                submit corresponding action using applicationId/state/API
+                if out-of-order:
+                    GET current status once more; reconcile without replaying old action
+                else:
+                    record outcome / response artifacts and next local decision
+        else if IN_PROGRESS:
+            record observation and wait
+        else if FAILED:
+            classify reason and agreed retry/correction policy
 
-    if waiting:
-        persist observation and next due time
-    if boundary ready:
-        acquire any screen artifact through the guarded action gateway
-        transaction: save artifact + CAS transition + audit + replace/remove job
-    if action required:
-        reconcile existing accepted/in-flight/unknown operation first
-        if a new/retry dispatch is permitted:
-            persist operation/dispatch intent with stable dispatchAttemptId
-            reserve shared quota idempotently for that dispatchAttemptId
-            perform bounded vendor call using stable idempotency key if supported
-            transaction: record outcome + schedule verification/retry
-    if failed/divergent:
-        persist classified recovery and next allowed work
-
-    mark webhook processed only when its result is durably applied/scheduled
-    return latest committed response
-finally:
-    release only the owned lock
+        persist next eligible background due time and receipt outcome
+        return latest committed response
+    finally:
+        release only the owned workflow lock
 ```
 
-Every outgoing action, including screen URL acquisition and direct PAN/limit submission, goes through the guarded action gateway. Status reads have separate cadence/capacity protection.
+Fresh PENDING permits a repeat call subject to compatibility, prerequisites, retry policy and quota. An optional local attempt marker is diagnostic; it does not supersede this vendor gate. If the out-of-order recovery read cannot establish a safe mapping, return saved waiting/recovery state and allow a future trigger rather than recurse indefinitely.
 
-### Lock and local commit
+Every outgoing action, including direct PAN/limit submission and applicable screen preparation, uses the shared quota gateway. Recovery getters use their applicable partner API allowance. Status reads are separately paced by driver behavior.
 
-Use `lock:bob:workflow:{workflowId}` for foreground update, worker and webhook processing. Configure bounded vendor timeouts shorter than the usable lock lease; renew ownership for an in-flight bounded operation if supported. Do not retain the lock while waiting for the next scheduled attempt.
+### Lock and version checks
 
-Local business updates also require compare-and-set version checking:
+All business mutations use `lock:bob:workflow:{workflowId}`. Vendor timeouts must fit usable lock ownership; renew when appropriate, release only the owner's token and abort intentional commits on detected ownership loss. Do not hold the lock across a scheduled retry delay.
 
 ```sql
 UPDATE workflow
@@ -342,9 +359,9 @@ WHERE workflow_id = :id
   AND version = :expected_version;
 ```
 
-A zero-row update means this proposed transition did not commit. Roll back its associated local writes and reread; do not retry the vendor side effect merely because the local CAS failed. Updates recording observations/recovery should use the same version discipline.
+Zero affected rows means the local transition did not commit. Roll back associated local writes and reread. A changed expected version rejects a competing commit; expiry of a Redis lock alone does not change the database version. This is not unconditional database fencing. Hard fencing would require a database-enforced ownership generation.
 
-The lock reduces overlap. CAS rejects a commit if a competing write has changed the expected version/state; lock expiry alone does not change that version. Check ownership before intentional local commits and abort on detected loss, preserving the remote outcome for reconciliation. This check is not an unconditional database fencing guarantee: if hard fencing is required, add a database-enforced ownership generation. Neither the lock nor CAS fences an already-sent vendor call or gives exactly-once external execution. A recorded in-flight operation adds another guard if a second owner appears after lease expiry; it cannot remove every uncertain remote outcome.
+The lock/version controls our local decisions and writes. Vegapay's gate decides whether the external action is still applicable. Neither fact alone establishes every simultaneous-request or universal exactly-once guarantee.
 
 ### Worker/webhook completion race
 
@@ -355,17 +372,17 @@ sequenceDiagram
     participant I as Durable inbox
     participant C as Coordinator
     participant DB as Workflow store
-    W->>C: Sync VKYC_PENDING
-    C->>DB: Under lock: read current state/version
+    W->>C: Synchronize VKYC_PENDING
+    C->>DB: Under lock: reread state/version
     H->>I: Persist authenticated event
-    Note over H,I: Acknowledge only after receipt commit
-    C->>DB: CAS transition to LIMIT_CREATION; cancel VKYC job
-    I->>C: Process completion event
-    C->>DB: Under same lock: reread LIMIT_CREATION
-    C->>I: Mark duplicate/completed receipt processed
+    Note over H,I: Acknowledge after receipt commit
+    C->>DB: Commit LIMIT_CREATION; remove VKYC job
+    I->>C: Process completion under same workflow lock
+    C->>DB: Reread LIMIT_CREATION
+    C->>I: Persist completed no-op receipt
 ```
 
-If the callback processor wins, the worker no-ops after rereading. Both outcomes stop at salary input. Neither performs limit generation just to prove that VKYC completed.
+If the callback processor wins, the worker drops obsolete work after rereading. If both fresh checks occur sequentially while still eligible, the redundant GET is acceptable. Both completion paths stop at salary input; neither automatically generates a limit.
 
 ## 10. Webhook delivery, duplication and order
 
@@ -377,175 +394,202 @@ Without a guaranteed vendor event sequence or version, a callback is a notificat
 
 A callback can advance an inactive user. It does not grant that user a new 12-hour activity lease or authorize polling all subsequent stages while inactive. A late callback after offer generation must not regress the local state.
 
-## 11. State mismatch and reconciliation policy
+## 11. State mismatch and reconciliation
 
-Keep three problems distinct: client staleness, observation staleness and real local/vendor divergence.
+Distinguish a stale frontend request, a stale/late event and a local workflow that missed partner progress. A later observed vendor state need not mean the vendor executed its states out of order; it may mean our response or intermediate observation was lost.
 
-| Case | Proposed decision |
+| Observation | Decision |
 |---|---|
-| Frontend expected state is old, no payload | Return latest committed state; reconcile only from the current stage |
-| Old input payload arrives after advancement | Conflict/current-state response; never replay it as another stage's input |
-| Vendor asks for another action within EKYC | Use stage compatibility and saved prerequisites; address enum order does not matter |
-| Expected boundary reached | Prepare required artifact, then apply allowed local edge |
-| Observation/event appears older | Keep local progress; verify current status and back off/investigate sustained divergence |
-| Vendor reports a later milestone | Verify prerequisites and completion evidence; hydrate artifacts; move only through explicitly allowed backend milestones |
-| User input or consent is missing | Stop at the required input boundary or flag reconciliation; do not invent input or skip it |
-| Vendor requests re-EKYC | Record explicit recovery-required status; permit automatic re-verification only when the partner contract and existing input allow it; otherwise require a defined user recovery journey |
-| Vendor confirms application rejection | Apply business rejection for an ongoing workflow, cancel normal work and audit evidence |
-| Conflicting terminal observations | Reconcile/investigate explicitly; no silent overwrite of an already completed journey |
-| Unrecognized vendor state | Preserve local state and observation; flag compatibility review rather than dispatch a guessed action |
+| Frontend expected state old, no payload | Return/reconcile the latest local stage; never replay old-stage work |
+| Old input arrives after local advancement | Conflict/current journey; never treat it as the next stage's payload |
+| Current applicable vendor state PENDING | Check local prerequisites and shared quota, then submit its action |
+| Another address microstate inside EKYC | Submit the corresponding saved address; remain EKYC_PENDING |
+| Vendor IN_PROGRESS | Submit no corresponding action; catch up verified local milestones if necessary, otherwise wait |
+| Expected boundary reached | Prepare required artifact, then commit its local edge |
+| Vendor beyond a missed boundary | Verify compatible completed milestones and prerequisites; recover artifacts and advance only supported local edges |
+| Required input absent | Record divergence; no automatic transition across the missing input boundary |
+| Earlier/stale observation | Preserve local progress; verify current status and investigate sustained contradiction |
+| Out-of-order action exception | One fresh status read and reconciliation; no business rejection or blind action replay |
+| Confirmed vendor rejection | Reject eligible ongoing journey and stop routine work |
+| Conflicting terminal observations / unknown state | Preserve evidence and flag investigation; no guessed overwrite or action |
+| RE_Ekyc_Verification / undocumented recovery | Use explicit partner/product recovery policy; missing policy stops automatic side effects |
 
-Fast-forward is not `if remote.ordinal() > local.ordinal()`. The enums are different, vendor stages may include recovery, and evidence may be stale. Use explicit predicates such as ?VKYC approved and salary still required? or ?offer exists and the salary action was already accepted.?
+Do not compare enum ordinals. Local and partner states model different things, and recovery branches are not a linear rank. Use explicit predicates combining partner progress, saved input and screen artifacts.
 
-Example: local `VKYC_PENDING`, current vendor `Limit_Generate/PENDING`, saved session reference present. Apply `LIMIT_CREATION`; do not cross the salary boundary. If current vendor reports an offer but local salary was never supplied, record divergence for review. Do not manufacture a salary submission to make the states align.
+For example, vendor Limit_Generate readiness with a saved VKYC session permits local LIMIT_CREATION, which still requires salary input. Vendor Offer_Generated can justify an offer catch-up only when the application's prerequisites and verified progress support that milestone. If salary input was never saved, flag divergence; do not manufacture it.
 
-### Explicit PAN correction recovery
+PAN correction follows the synchronous contract: invalid PAN/DOB leaves local input and vendor PAN/PENDING available. No PAN_VALIDATION_PENDING-to-PAN_VALIDATION recovery edge is added. An unexpected post-acceptance PAN FAILED is classified using its actual retry contract; it does not silently reopen the form.
 
-If the current local state is `PAN_VALIDATION_PENDING`, a current authoritative vendor read shows `PAN_VERIFIVATION/FAILED`, the agreed error mapping identifies a user-correctable PAN/name/DOB failure, no progression beyond PAN has been confirmed, and the application is not rejected, authorize the specific recovery edge to `PAN_VALIDATION`.
+If an out-of-order recovery read fails or remains incompatible, preserve the accepted input/local waiting state and retry synchronization on a future trigger. Fetching a new status is a recovery step, not permission for an unlimited GET/action loop.
 
-In one version-checked transaction, preserve the submitted document/revision, mark the old operation `NEEDS_USER_CORRECTION`, record the reason and audit, reopen the PAN input state, and remove obsolete pending work. A new submission creates a new payload revision and operation under the same user/action quota. An immediate synchronous decline already leaves the user at PAN input and does not need this recovery edge.
+## 12. Lost responses, artifact hydration and crash recovery
 
-Technical `FAILED` and unknown timeout outcomes do not reopen the form. Unknown or unmapped reasons remain `NEEDS_RECONCILIATION`. Partner error mappings are a contract input; no numeric reason codes are invented here.
+Local persistence and external progress are separate. A lost response leaves our local stage unchanged even though the partner may already be processing the action. The next synchronization always checks current partner truth before deciding whether to call an action again.
 
-The default for any other undocumented recovery branch is to stop automatic actions and surface recovery metadata. A new backward user flow requires an explicit recovery rule rather than weakening the transition validator.
+### Three recovery checks
 
-## 12. Action identity, duplicates and crash recovery
+1. **Vendor evidence:** what current state/status does this application have, and what completed milestone does that evidence imply under the contract?
+2. **Local prerequisites:** is the input required for that milestone saved? Presence alone does not prove a request was sent or accepted.
+3. **Response artifacts:** did the lost response contain data needed in local documents or for the next screen? Retrieve it using the partner's specific read/recovery API before committing the new local state.
 
-Use a logical operation identity based on workflow, action API, input revision and relevant stage/session generation. Technical retries keep that identity. A corrected PAN/DOB submission creates a new input revision and logical operation. Payload hashes/reference IDs avoid storing sensitive data in quota/audit keys.
+When the same compatible vendor gate is PENDING, a repeat call is allowed subject to its quota and applicable retry policy. When processing or later progress is confirmed, do not replay the preceding action. A request overtaken between GET and action can return out-of-order; refresh status and reconcile.
 
-Operation states include `READY`, `IN_FLIGHT`, `ACCEPTED`, `UNKNOWN`, `RETRY_DUE`, `NEEDS_USER_CORRECTION`, `RESOLVED` and `NEEDS_RECONCILIATION`. Dispatch attempts are separate records under one operation, so a technical retry can consume another quota slot without becoming a new business action.
+### Address example
 
-If an action was accepted but the next status read remains `PENDING`, retain the accepted marker, wait and verify progress. Do not immediately resubmit the same address/verification action. If the partner explicitly returns a retryable failure for that operation, classify it; if acceptance and failure evidence conflict, reconcile rather than guessing.
+Both addresses are saved and the local journey is EKYC_PENDING. The permanent-address request succeeds, but its response is lost. Next status requests current address. The backend submits the saved current address and retains EKYC_PENDING. At the VKYC boundary, retrieve/store the launch URL before transitioning to VKYC. Completing one vendor address step does not mean the entire local EKYC stage finished.
 
-| Crash point | Recovery |
+If the partner progressed but the required address/session/salary was never saved, this is divergence rather than normal response-loss recovery. Stop automatic advancement and retain evidence.
+
+### Missing artifacts
+
+If a lost response carried an address record, URL or offer data needed locally, use the corresponding partner retrieval capability. Existing prototype examples include getEkycUrl and getLimit; other getters described by the user, such as address retrieval, are contract context rather than all being present in VegapayClient. Distinguish retrieving the existing artifact from replaying an obsolete generation/submission action.
+
+An artifact-recovery call observes its applicable partner allowance. A failed retrieval leaves the user at the waiting local stage; do not expose an empty next screen. Related artifact writes, local transition and audit commit together. Multiple permitted backend edges may be repaired only with explicit compatible milestone evidence and without skipping an input boundary.
+
+| Crash point | Next step |
 |---|---|
-| Before input acceptance commit | Client can retry submission; use input identity where available |
-| After accepted input, before immediate progression | Resume from pending; worker/frontend needs no repeated form |
-| After dispatch intent, before send | Intent alone cannot prove send did not happen; reconcile or retry with partner idempotency |
-| After partner accepts, before local outcome commit | Treat attempt as unknown; query current status/outcome before retry |
-| After local transition commit, before frontend response | GET or a duplicate submission returns committed journey |
-| After webhook receipt commit, before processing | Inbox job retries; no lost successful acknowledgment |
-| After job claim, before finish | Lease expires; next worker rechecks stage, operation and generation |
+| Before submitted input is saved | Client can submit again; no accepted local prerequisites exist yet |
+| After input save, before partner action | Fresh applicable PENDING permits dispatch with quota |
+| After partner acceptance, before response/local update | Fetch status; IN_PROGRESS/later progress drives waiting or catch-up |
+| Request/response uncertain, same gate remains PENDING | Repeat permitted action subject to quota; no request-key mechanism required |
+| After lost artifact response | Retrieve existing data, persist it, then advance locally |
+| After local transition commit, before frontend receives it | GET/reload returns committed journey |
+| After webhook receipt commit, before processing | Durable inbox retries processing |
+| After background job claim | Claim expires; next worker rereads local eligibility and vendor state |
 
-When partner idempotency keys are supported, reuse a stable key for the same logical operation. If the vendor advances beyond the action, resolve the operation using the authoritative evidence. If current status still cannot establish whether the side effect occurred, no universal safe automatic retry exists without partner idempotency or a queryable outcome. Set `NEEDS_RECONCILIATION` and preserve the application instead of claiming exactly-once behavior.
+The confirmed gate makes a detailed accepted/in-flight/unknown ledger unnecessary as the primary lost-response permission mechanism. It does not establish every concurrency/transport guarantee, or make a local transaction atomic with Vegapay. Optional dispatch/audit history can improve diagnosis and retry accounting; it must not override a fresh gate solely because an earlier local outcome is uncertain.
 
-A local response cache or ledger alone does not make the vendor call idempotent.
+## 13. Action limits and classified retries
 
-## 13. Rate limits and classified retries
+### Shared admission
 
-### Shared action accounting
+Apply five calls per rolling hour per stable customer and action API. Rolling-hour interpretation is the chosen model, not an established historical implementation. New workflow creation does not reset the user's allowance. Foreground submission, polling action, worker, callback-triggered action and technical retry all use the same admission point.
 
-Apply a Redis rolling-window reservation keyed by `customerId + actionApi`. Atomically remove expired reservations, count the preceding hour, reserve a unique dispatch token if fewer than five remain, otherwise return the earliest permitted time. A corrected submission and a technical retry use the same user/action allowance. A new workflow does not reset it.
+An atomic Redis reservation removes expired entries, counts the preceding hour and reserves one dispatch token if fewer than five remain. Denial returns the earliest permitted time. An identifier per actual dispatch attempt allows repeated admission checks for that attempt to count once; a new outbound retry counts again. This bookkeeping need not use a full business-operation ledger.
 
-Persist a stable `dispatchAttemptId` derived from operation identity and attempt number before quota admission. Reserve before dispatch, using that identity so repeated admission checks for the same attempt do not consume extra slots. A permitted technical retry increments the attempt number and consumes another slot. Be conservative after a crash: an uncertain reservation remains counted until expiry because it may have reached the partner. If failure is proven to precede any send, a policy can release that specific reservation. This may temporarily underuse quota but avoids exceeding the contract.
+After a crash, conservatively retain an uncertain quota reservation until expiry because the request may have reached the partner. Separate quota accounting from action permission: a fresh PENDING gate can permit a retry, while the quota can still defer it. If quota storage is unavailable, do not perform an action that cannot be accounted for.
 
-Do not substitute a bursty token bucket for the exact modeled rolling-hour rule. Separate deployment-wide capacity/circuit controls can protect infrastructure, but are not claimed partner quotas. If quota storage is unavailable, do not dispatch an action that cannot be accounted for; return waiting/recovery information.
+Status GET has no reported API-specific cap. In the primary design, both drivers can issue sequential reads. Background cadence and bounded concurrency control the worker contribution; optional coalescing can further reduce traffic. Recovery getters honor their applicable partner API limits.
 
-No specific status cap was reported. Cadence, one shared due time and bounded worker concurrency still protect status traffic. A quota-blocked action should not cause two drivers to repeatedly call its endpoint or check the same unchanged condition every three seconds.
+### Failure policy
 
-### Retry classification
-
-| Failure | Policy |
+| Failure | Decision |
 |---|---|
-| Invalid PAN/DOB or other deterministic input problem | User correction; new input revision, no identical automatic retries |
-| Vendor `FAILED` with confirmed technical retry permission | Same logical operation, bounded scheduled retry and shared quota |
-| Status GET network error / transient server error | Bounded observation retry/backoff; no side-effect ambiguity |
-| Action timeout or uncertain transport outcome | Mark unknown; reconcile before a side-effect retry |
-| Action failure confirmed not applied and transient | Same operation may retry within its budget and quota |
-| HTTP 429 | Honor supplied retry guidance and local quota; no immediate loop |
-| Authentication/configuration failure | Stop automatic retries and alert integration ownership |
-| Business rejection | Terminal business outcome, not a retry |
-| Retry budget exhausted | Recovery/investigation status with retained input; not automatic rejection |
+| Synchronous invalid PAN/DOB | Remain at input/vendor pending; corrected or repeated submission subject to quota |
+| Action timeout / response lost | Fresh GET first; applicable PENDING permits retry, processing/ahead permits waiting/catch-up |
+| Out-of-order action response | One bounded fresh GET and local reconciliation; do not blindly replay or reject |
+| Vendor FAILED | Inspect reason and the contract's allowed retry/recovery action; missing mapping stops automatic action |
+| Status GET transport/transient error | Preserve local state; later observation retry, no guessed action |
+| HTTP 429 | Honor partner guidance and shared allowance; no immediate retry loop |
+| Authentication/configuration error | Stop automatic retries and alert integration ownership |
+| Business rejection | Apply terminal business outcome |
+| Retry budget exhausted / unresolved divergence | Retain input and recovery information; not automatic rejection |
 
-Illustrative technical budget: initial dispatch plus at most two automatic retries per logical operation after confirming retry safety, with 30-second then 120-second retry delays and nonnegative jitter. Respect any later quota/partner deadline. Routine unchanged `IN_PROGRESS` observations use stage cadence, not the technical retry counter. Observation transport errors back off from 30 seconds to five minutes; after five consecutive errors set degraded recovery metadata and continue only under eligible demand/worker policy and available integration capacity. None of these numeric defaults is asserted as historical production configuration.
+For mapped FAILED recovery, use the specific retry action permitted by the partner. Do not assume every normal action API accepts a FAILED state merely because retries are possible. This classification extends the current progression method, which currently dispatches only for PNEDING.
 
-A recorded `retry_at` is an eligibility deadline, not a promise to run a worker for every stage. EKYC/VKYC retries can be consumed by an eligible worker or frontend update; PAN/limit pending retries wait for the next foreground update because routine worker scope remains EKYC/VKYC. Webhook inbox processing has its own durable delivery work and is not restricted by user activity.
+An illustrative technical budget is the initial action plus at most two automatic retries for one unchanged input revision, with 30-second then 120-second delays and nonnegative jitter. Every attempt still needs fresh state eligibility and quota. User-corrected PAN input is a new input revision, while the same hourly customer/API allowance remains. These defaults are proposed configuration, not reported production numbers.
 
-A circuit breaker is a proposed shared gateway control for sustained technical failure. Per-user quota exhaustion is an expected admission decision, not evidence that the partner is unhealthy. Half-open probes and background jobs must still respect action admission. Return the actual local state plus degraded/retry metadata; do not invent a local `PROCESSING` enum that the prototype does not contain.
+Routine IN_PROGRESS observations do not consume the technical action retry budget. Worker retries apply only to eligible EKYC/VKYC jobs; PAN/limit synchronization waits for foreground demand. Webhook inbox processing is durable delivery work and is not blocked by user inactivity.
 
-## 14. Load, deployment and observability
+A circuit breaker for sustained technical failure is an optional gateway enhancement. Expected local quota denial is not a partner outage. Preserve the real local state with waiting/retry information; do not introduce an undocumented PROCESSING business enum.
 
-Let A_E and A_V be the active, due EKYC/VKYC populations and I_E/I_V their current average observation intervals in seconds. Approximate routine status load as `A_E / I_E + A_V / I_V`, plus admitted foreground resume/webhook checks. Deduplication subtracts overlapping driver demand. Actions depend on required microstates, operation state and user quotas, not on every status refresh.
+## 14. Optional optimizations, load and observability
 
-At a steady 30-minute VKYC cadence, a 12-hour activity window implies roughly 24 scheduled reads per application, plus earlier backoff and resumed visits. This illustrates why ?active for 12 hours? still needs budgeting; it is not a measured traffic claim. Comparing three-second UI refresh with thirty-minute vendor reads separates UI responsiveness from partner-state freshness.
+### Optional shared status scheduling
 
-Choose bounded worker concurrency and short queue claims; scale by due-job backlog and vendor capacity. Partition work by workflow identity if necessary, while keeping shared quota/lock ownership. A background polling system does not make the underlying hours-long bank process faster; it reduces detection delay while an application is eligible.
+A shared nextSyncAt or recent-observation timestamp can reduce redundant GETs. After taking the workflow lock, a caller can return saved state if another trigger recently synchronized and the next check is not yet due. When due, one caller reads status and advances the shared timestamp. New input, actual app return or a meaningful callback can prioritize a fresh check under an explicit policy.
 
-Monitor:
+If GET-on-entry is used as a resume signal, optional resume markers may prevent every three-second UPDATE from resetting backoff. This changes freshness/traffic tradeoffs and is not required for the primary fresh-status-per-trigger design. Do not describe coalescing as necessary to make vendor action acceptance safe.
 
-- Status/action call counts by trigger and stage; action quota deferrals.
-- Queue lag, active/eligible population and expired-lease skips.
-- Vendor processing age, unchanged observations and detection lag after known completion.
-- Lock contention/lost ownership, CAS conflicts and stale jobs.
-- Webhook receipt-to-processing delay, duplicate receipts and current-status mismatches.
-- Accepted/unknown actions, retries, user-correction outcomes and unresolved divergences.
+### Optional dispatch history
 
-Audit each transition with its source, expected version, observed vendor state/status and operation/reference. Redact identity data and never log raw verification secrets. Preserve the supplied SDK-only Aadhaar boundary and consent/reference model. These are data handling requirements, not a compliance certification claim.
+A detailed dispatch ledger can retain action, input revision, request/response references and timing for auditing, diagnostics, technical retry budgets and quota explanations. Its local ACCEPTED or UNKNOWN flag does not prohibit a call that current partner PENDING explicitly permits. Request-key deduplication is not presumed. Add complexity only when its operational value warrants it.
 
-## 15. Implementation sequence and validation scenarios
+### Load model
 
-Implement only when requested; writing this design does not change runtime behavior.
+Let F be admitted foreground status requests per second, A_E/A_V the active worker populations and I_E/I_V their average background intervals in seconds. Without coalescing, approximate status load is `F + A_E / I_E + A_V / I_V`, plus callback/recovery reads. Worker and foreground overlap is intentionally counted. Optional shared scheduling reduces the overlapping component.
 
-1. Introduce persistent workflow/documents and transactional local writes; keep the current state machine and response builder semantics.
-2. Add common lock/version enforcement and outbound action accounting to all existing entry paths.
-3. Add durable operation attempts and classified error/recovery policy before enabling additional triggers.
-4. Add the webhook inbox and shared coordinator; prove frontend/webhook races.
-5. Add activity metadata and deduplicated due jobs; enable workers for EKYC then VKYC behind configuration.
-6. Observe job/partner traffic and tune cadence without changing the stated active-user or quota contracts.
+An on-screen three-second frontend poll can produce roughly 1,200 status calls per hour for that user if every update synchronizes. A 30-minute steady VKYC worker cadence contributes about 24 reads over twelve hours, plus earlier backoff/returns. These are arithmetic illustrations, not measured production traffic. The twelve-hour activity definition therefore still needs a deliberate worker interval.
 
-| Test scenario | Expected result |
+Actions occur only at applicable gates with input, quota and retry eligibility. Poll frequency does not grant extra action allowance. Background work does not speed up bank processing; it reduces completion-detection delay while eligible.
+
+### Operations and data boundaries
+
+Bound worker concurrency and database claim leases; scale from queue lag and vendor capacity. Preserve bank/scapia deployment boundaries described above. Retain the SDK-only raw Aadhaar boundary, consent/reference audit data and redacted operational logs. These are architectural requirements, not certification claims.
+
+Monitor vendor state/status and stage age, status calls by trigger, action quota deferrals, retries/out-of-order responses, artifact-recovery failures, divergence, webhook delay/duplicates, lock contention, version conflicts, queue lag and expired activity. Audit which current observation and stored prerequisites justified each local transition.
+
+## 15. Implementation sequence and validation
+
+These are proposed runtime changes; this documentation update implements none of them.
+
+1. Preserve existing domain handlers, stop boundaries and response builder while adding persistent local transactions where needed.
+2. Apply shared workflow locking, optional version safeguards and common action admission to all mutation paths.
+3. Extend stage-aware progression with current-status catch-up, artifact retrieval and bounded out-of-order recovery.
+4. Add authenticated durable webhook receipt and shared completion processing.
+5. Add twelve-hour foreground activity and due jobs for EKYC/VKYC; enable paced workers behind configuration.
+6. Measure status/worker cost; add coalescing or detailed ledgers only if justified.
+
+| Scenario | Expected outcome |
 |---|---|
-| Input accepted; immediate progression fails | Saved pending input remains; later synchronization does not require the form |
-| Concurrent foreground and worker check | One due observation/action; other caller returns committed state |
-| Worker and callback complete VKYC | One committed `LIMIT_CREATION` transition; no limit generation |
-| Duplicate or delayed callback | Durable receipt/no-op or current-status reconciliation; no regression |
-| Callback ingress DB failure | No success acknowledgment before durability |
-| App closes | Worker continues only within the 12-hour activity window |
-| Worker executes / callback arrives | Neither refreshes activity |
-| App returns after missed callback | Activity resumes and a coalesced authoritative check recovers the current boundary |
-| Five action attempts in preceding hour | Sixth attempt deferred across all drivers, even another workflow for the same user |
-| Two workflows share the same user quota | Atomic shared admission keeps the modeled cap |
-| Many three-second UI updates | Saved-state responses between shared due checks; no repeated backoff reset |
-| Partner accepted but still reports PENDING | Wait/verify existing operation; no blind duplicate action |
-| Crash after partner acceptance | Unknown attempt reconciles; unsafe automatic retry is blocked |
-| PAN corrected after deterministic decline | New input revision; same customer/action quota |
-| Correctable PAN FAILED after acceptance | Guarded recovery edge reopens PAN input and preserves the old revision/audit |
-| Technical PAN FAILED or unconfirmed outcome | No correction edge; retry/reconcile the same operation |
-| Remote ahead, required local input missing | Flag divergence; do not skip user boundary |
-| Remote earlier or re-verification requested | No ordinal regression; explicit verification/recovery policy |
-| Lock lease lost during external call | Abort on detected ownership loss; a competing version change rejects CAS; preserve remote-outcome ambiguity |
-| Old worker finishes after new job scheduled | Token/generation check protects the newer job |
+| Synchronous PAN validation invalid | Local PAN input/vendor PAN pending remain open; correction uses same application |
+| PAN success response lost | Stored submission plus confirmed partner progress permits local catch-up without obsolete PAN replay |
+| Input accepted, immediate progression fails | Saved pending input remains; later trigger needs no repeated form |
+| Request not accepted and gate still PENDING | Another quota-limited action call is permitted |
+| Partner processing/ahead after response loss | No preceding action replay; wait or reconcile local milestones |
+| GET saw PENDING, partner advanced before action | Out-of-order response causes bounded reread/reconciliation |
+| Other address now requested | Use its saved input and keep EKYC_PENDING |
+| Missing URL/offer response data | Retrieve and persist it before next screen; retrieval failure keeps waiting |
+| Vendor ahead, required user input absent | Flag divergence; do not skip boundary |
+| Frontend then worker under same lock | Two status GETs are acceptable; each action depends on current gate/quota |
+| Worker and callback complete VKYC | One committed LIMIT_CREATION result; second completion no-ops; no limit action |
+| Duplicate/late callback or failed ingress persistence | No regression; no success acknowledgment before durability |
+| App closes / lease expires | Worker runs only within twelve-hour eligibility; callback or return still recovers |
+| Worker or callback executes | Neither refreshes activity |
+| Return after missed webhook | Fresh synchronization reconciles and restores background eligibility |
+| Five action calls in preceding hour | Sixth deferred across triggers and workflows for that customer/API |
+| Classified FAILED/unknown recovery | Use only mapped retry permission; no guessed old-stage dispatch or backward edge |
+| Detected lock loss or competing local version | Abort intentional stale work; changed expected version rejects local commit |
+| Old job completes after replacement | Claim/generation protects newer job |
+| Optional coalescing enabled | Fewer status reads without changing prerequisites or action allowance |
 
-The current six [prototype tests](src/test/java/org/example/service/WorkflowProgressionTest.java) remain baseline checks. This matrix is the proposed extension's acceptance suite, not an assertion that those tests already exist.
+The six existing [prototype tests](src/test/java/org/example/service/WorkflowProgressionTest.java) cover the baseline one-step behavior. This matrix is proposed extension validation, not a claim that these tests or recovery branches already exist.
 
 ## 16. Interview grilling and answer checkpoints
 
-Practice explaining the decision and its limitation, then a concrete failure example.
+Explain the actual contract and the local decision, then its limit.
 
-1. **?Why add background work if the UI already polls??** Progress continues during the 12-hour recent-activity lease after app closure. A shared due decision avoids duplicating on-screen polling, and callbacks remain independent.
-2. **?What is active? A pending application??** No. Give the authenticated GET/UPDATE time rule, twelve-hour expiry and recheck at execution. Explain that workers do not refresh their own eligibility.
-3. **?Can you guarantee freshness for everyone??** Explain the intentionally conditional guarantee. Inactive users rely on webhook or return; partner outages/quotas further bound liveness.
-4. **?The UI polls every three seconds. How many bank calls occur??** Use shared due time, stage cadence, resume coalescing and operation admission. UI refresh cadence is not vendor polling cadence.
-5. **?Why does a Redis lock not solve everything??** Lease expiry, stale owners and remote-success/local-crash gaps. CAS guards competing commits with changed versions, detected ownership loss aborts the write, and partner idempotency/outcome evidence is needed for external effects.
-6. **?A worker and webhook finish together. Walk me through it.?** Durable inbox, same workflow lock, reread, one eligible CAS transition, duplicate no-op and obsolete job cancellation.
-7. **?What happens after acknowledging a webhook and crashing??** Its receipt must already be durable; processing retries. Lock contention alone cannot justify discarding an acknowledged event.
-8. **?A webhook arrived later, so it must be newer, right??** Receive time does not prove vendor business order. Without sequence guarantees, reconcile current partner status.
-9. **?Vegapay says PENDING again after your successful action. Retry??** Check accepted/in-flight/unknown operation and progress evidence. Delay/reconcile; do not recreate a known accepted business action.
-10. **?Can you promise exactly-once action execution??** State the unconfirmed partner contract. Explain conditional idempotent retries and the conservative unresolved-outcome path.
-11. **?Remote state is ahead. Why not simply jump there??** Prerequisites, consent, screen artifacts, completed-milestone evidence and explicit compatibility edges. Give the salary-boundary example.
-12. **?Is corrected PAN a retry??** It is a new business input revision. Technical retries reuse one operation identity. Both consume the same hourly action allowance.
-13. **?FAILED means try the corresponding API, correct??** Only after classifying the reason and checking safety, input, operation state, budget and quota. Rejection is a separate state.
-14. **?Why five calls per user, not per workflow??** Contract identity survives reapplication; otherwise a new workflow can evade the cap. Use atomic user/action accounting across triggers.
-15. **?If getStatus has no limit, why bother with scheduling??** Status still costs capacity and repeated observations often add no information. Explain state-specific expected durations and queue contention.
-16. **?What happens to a user away for a day if the callback is lost??** Lease expired, no routine background work. Returning GET/UPDATE reactivates and reconciles; do not promise silent inactive completion.
-17. **?What about re-EKYC or an unknown partner state??** Explicit recovery/compatibility policy. Default stops automatic side effects rather than weakening state guards.
-18. **?What did you actually build versus propose??** Name baseline code, assumed lock/webhook and the new worker/ledger/version/recovery design separately. Demonstrate the current one-step behavior before discussing extensions.
+1. **"What backend complexity exists if the frontend triggers polling?"** Domain projection, saved prerequisites, permitted transitions, screen hydration, resumption, concurrency and partner constraints. Trigger choice does not remove backend ownership.
+2. **"Why add a worker?"** Progress during the twelve-hour recent-activity window after app closure. Frontend and webhook remain valid drivers; all use one policy.
+3. **"Does the lock eliminate consecutive status reads?"** No. Primary design accepts redundant serialized GETs. Worker cadence controls background cost; coalescing is optional.
+4. **"The UI refreshes every three seconds. How many vendor reads?"** Primary design may read on each eligible update, plus paced workers. Give the arithmetic and separately explain action quotas.
+5. **"The action response was lost. Can the next request retry?"** Fresh compatible PENDING permits quota-limited retry. Processing/ahead means wait/catch up; no old-stage replay.
+6. **"What does Vegapay use instead of request-key deduplication here?"** Its application/current-state gate. Invalid synchronous PAN leaves that gate open; obsolete-state calls return out-of-order. Do not infer every simultaneous-request guarantee.
+7. **"What if status was PENDING but another actor advanced it before dispatch?"** Catch out-of-order, GET once more and reconcile. No rejection or blind loop.
+8. **"Saved address data proves the request succeeded, right?"** It proves prerequisites. Current compatible partner progression provides acceptance/completion evidence.
+9. **"The other address is now pending. Is EKYC complete?"** No. Submit saved corresponding input and remain EKYC_PENDING until the VKYC boundary/artifact is ready.
+10. **"Partner is ready but the local URL is missing?"** Retrieve the existing artifact through a supported getter; persist before transitioning. Retrieval failure keeps local waiting state.
+11. **"Remote ahead, salary absent. Jump forward?"** Flag divergence and stop at the user boundary; no manufactured input.
+12. **"Worker and webhook finish together. What happens?"** Durable receipt, same workflow lock, reread, one eligible local transition and duplicate no-op. Completion stops at salary input.
+13. **"Does Redis establish exactly-once remote execution?"** No. Explain local serialization and precise version limits; vendor gating handles action applicability, without inventing unconfirmed guarantees.
+14. **"What makes a user active?"** Authenticated GET/UPDATE in the last twelve hours. Worker/callback do not renew that window.
+15. **"What if an inactive user's webhook is lost?"** No continuous inactive freshness guarantee. Foreground return triggers current-status recovery.
+16. **"Does FAILED mean repeat any API?"** Classify reason and supported retry action. Unmapped failure needs investigation, not guessed dispatch or business rejection.
+17. **"What does a PAN correction change?"** New user input revision while the same vendor gate is open. Same customer/action quota; no special deduplication identity required.
+18. **"Which parts exist in code?"** One-step orchestration and typed stored-data projection. Locks/webhook are assumed baseline; generalized recovery/workers/durable receipt are proposed; ledger and coalescing optional.
 
-### A scenario to rehearse in detail
+### Recovery scenario to rehearse
 
-The user submits addresses. Local state becomes `EKYC_PENDING`. A worker submits the permanent address and receives success, then dies before storing the outcome. The next UI update observes the same vendor `PENDING` state.
+The user submitted both addresses. Permanent-address action reached Vegapay, but its response was lost. Local workflow remains EKYC_PENDING. On the next request:
 
-Explain the durable input revision, pre-dispatch operation/attempt, customer/action quota reservation, unknown-outcome reconciliation and partner-idempotency limitation. Say exactly why the second caller cannot infer that another address submission is safe. Then explain how confirmed vendor progression resolves the attempt and permits the next stage action.
+- Current-address/PENDING: submit its saved input and remain in local EKYC pending.
+- Same applicable permanent-address/PENDING: a quota-limited repeat is allowed by the gate.
+- Processing: submit no corresponding action; wait.
+- VKYC boundary: retrieve/store its launch URL, then transition locally.
+- Advanced milestone with required input missing: preserve state and flag divergence.
+- Action overtaken after the read: out-of-order response triggers bounded fresh reconciliation.
+
+Explain why the local form is not collected again and why saved input alone is not proof of the earlier request's success.
 
 ## 17. Source map and comparison
 
@@ -553,14 +597,14 @@ Sources: [ProjectDetails](ProjectDetails.md), [WorkflowOrchestrator](src/main/ja
 
 | Dimension | Design 1 | Design 2 |
 |---|---|---|
-| Triggers | Frontend and assumed VKYC callback | Same triggers plus recently active EKYC/VKYC workers |
-| Domain ownership | Backend state, input and artifact projection | Same ownership with explicit reconciliation policy |
-| Scheduling | Frontend-driven single progression attempts | Shared due time, activity lease and durable jobs |
-| Local concurrency | Assumed workflow Redis lock | Lock plus version checks and transactional results |
-| External duplication | Lock/quota limit overlap; crash ambiguity remains | Operation ledger and conditional partner idempotency/reconciliation; ambiguity still explicit |
-| Webhook recovery | Assumed eligible completion under lock | Durable inbox, current-status verification and shared application policy |
-| State mismatch | Exact-boundary progression and stale request guard | Compatibility/prerequisite checks and recovery metadata |
-| Retries | User correction boundary; broader policy unspecified | Classified safe retries, input revisions and shared budgets |
-| Inactive freshness | Callback or next foreground update | Same policy after twelve-hour activity expiry |
+| Drivers | Frontend and assumed VKYC callback | Same plus active EKYC/VKYC worker jobs |
+| Action acceptance | Confirmed partner state gate | Same gate, shared prerequisites and quota |
+| Status traffic | Foreground fresh reads | Fresh reads per eligible trigger; worker cadence; coalescing optional |
+| Local concurrency | Assumed workflow Redis lock | Same lock plus proposed transactions/version checks |
+| Lost responses | Contract recovery described; prototype exact-boundary limitation | Explicit current-state catch-up and artifact restoration |
+| Webhook processing | Assumed eligible completion under lock | Durable receipt and shared recovery/application policy |
+| Retries | Corrected PAN and reported hourly limits | Classified retry permission, same hourly cap and bounded recovery |
+| Detailed dispatch ledger | Not required | Optional diagnostics/accounting |
+| Inactive freshness | Callback or next frontend visit | Same after twelve-hour activity expiry |
 
-The worker improves when synchronization runs. The reconciliation, operation identity and concurrency rules determine whether it is correct.
+The worker changes when reconciliation runs. The partner gate, local prerequisites, screen artifacts and permitted transitions determine what may happen.
