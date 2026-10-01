@@ -151,6 +151,7 @@ public class WorkflowOrchestrator {
                 default -> { }
             }
         }
+            // here should be directly return after the input processing and saving, transition state or we should also do one pending vegapayhandler, because even if the system fails the state is already transitioned to the next state where input is not required so we are not taking input form the user twice or thrice
 
         WorkflowState currentState = workflowEntity.getWorkflowState();
         if (vegapayProgressionService.isPending(currentState)) {
