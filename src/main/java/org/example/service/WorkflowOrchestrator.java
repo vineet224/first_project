@@ -1,6 +1,5 @@
 package org.example.service;
 
-import org.example.dao.DocumentMockRepository;
 import org.example.dao.UserWorkflowMappingRepository;
 import org.example.dao.WorkflowMockRepository;
 import org.example.dto.WorkflowState;
@@ -13,31 +12,40 @@ import org.example.vegapay.client.VegapayClient;
 import org.example.vegapay.request.VegapayCustomerRegistrationRequest;
 import org.example.vegapay.response.VegapayCustomerRegistrationResponse;
 
+import org.springframework.stereotype.Service;
+
 import java.time.Duration;
 
 import java.time.LocalDateTime;
 import java.util.Optional;
 import java.util.UUID;
 
+@Service
 public class WorkflowOrchestrator {
 
     private final WorkflowResponseBuilder workflowResponseBuilder;
     private WorkflowMockRepository workflowMockRepository;
-    private DocumentMockRepository documentMockRepository;
     private UserWorkflowMappingRepository userWorkflowMappingRepository;
     private VegapayClient vegapayClient;
+    private final WorkflowStateHandlers workflowStateHandlers;
+    private final VegapayProgressionService vegapayProgressionService;
 
     public WorkflowOrchestrator(WorkflowResponseBuilder workflowResponseBuilder,
-            UserWorkflowMappingRepository userWorkflowMappingRepository) {
+            UserWorkflowMappingRepository userWorkflowMappingRepository,
+            WorkflowMockRepository workflowMockRepository,
+            VegapayClient vegapayClient,
+            WorkflowStateHandlers workflowStateHandlers,
+            VegapayProgressionService vegapayProgressionService) {
         this.workflowResponseBuilder = workflowResponseBuilder;
         this.userWorkflowMappingRepository = userWorkflowMappingRepository;
-        this.workflowMockRepository = new WorkflowMockRepository();
-        this.documentMockRepository = new DocumentMockRepository();
+        this.workflowMockRepository = workflowMockRepository;
+        this.vegapayClient = vegapayClient;
+        this.workflowStateHandlers = workflowStateHandlers;
+        this.vegapayProgressionService = vegapayProgressionService;
     }
 
     public WorkflowGetOrUpdateSingleFrontendResponse getWorkflowFrontendResponse(String workflowId) {
-        WorkflowGetOrUpdateSingleFrontendResponse response = new WorkflowGetOrUpdateSingleFrontendResponse();
-        return workflowResponseBuilder.buildWorkflowGetOrUpdateSingleFrontendResponse(response);
+        return buildResponse(workflowId);
     }
 
     public WorkflowGetOrUpdateSingleFrontendResponse createWorkflow(WorkflowCreationRequest workflowCreationRequest) {
@@ -133,13 +141,32 @@ public class WorkflowOrchestrator {
             throw new IllegalArgumentException("Workflow State Offer Generated");
         }
 
-        // now if it is a pending state so this must be pollig call from the frontend
-        // now check until the expected state "ABC" from the vegapay and until keep
-        // polling and making vegapay api call to update their state and
-        // after all that update the state according to the "ABC" at the db workflow
-        // state and the ekyc document of vkyc document or any other is alredy updated
-        // by the vegapay state handler
+        // Screen-entry updates without input only progress pending stages.
+        if (workflowUpdateRequest.getWorkflowStateRequestPayload() != null) {
+            switch (workflowEntity.getWorkflowState()) {
+                case PAN_VALIDATION -> workflowStateHandlers.handlePanValidation(workflowUpdateRequest, workflowEntity);
+                case EKYC -> workflowStateHandlers.handleEkyc(workflowUpdateRequest, workflowEntity);
+                case VKYC -> workflowStateHandlers.handleVkyc(workflowUpdateRequest, workflowEntity);
+                case LIMIT_CREATION -> workflowStateHandlers.handleLimitCreation(workflowUpdateRequest, workflowEntity);
+                default -> { }
+            }
+        }
+
+        WorkflowState currentState = workflowEntity.getWorkflowState();
+        if (vegapayProgressionService.isPending(currentState)) {
+            vegapayProgressionService.pollVegapay(
+                    vegapayProgressionService.stopStateFor(currentState),
+                    workflowEntity.getWorkflowId(), workflowEntity.getApplicationId());
+        }
+        return buildResponse(workflowEntity.getWorkflowId());
+    }
+
+    private WorkflowGetOrUpdateSingleFrontendResponse buildResponse(String workflowId) {
+        WorkflowEntity latest = workflowMockRepository.getWorkflowEntity(workflowId)
+                .orElseThrow(() -> new IllegalArgumentException("Workflow Not Found"));
         WorkflowGetOrUpdateSingleFrontendResponse response = new WorkflowGetOrUpdateSingleFrontendResponse();
-        return response;
+        response.setWorkflowId(latest.getWorkflowId());
+        response.setWorkflowState(latest.getWorkflowState());
+        return workflowResponseBuilder.buildWorkflowGetOrUpdateSingleFrontendResponse(response);
     }
 }

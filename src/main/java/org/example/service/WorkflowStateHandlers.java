@@ -1,6 +1,5 @@
 package org.example.service;
 
-import java.time.LocalDateTime;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -10,9 +9,7 @@ import org.example.dto.WorkflowState;
 import org.example.dto.request.EkycDetailRequest;
 import org.example.dto.request.PanDetailsRequest;
 import org.example.dto.request.VkycDetailRequest;
-import org.example.dto.request.WorkflowStateRequestPayload;
 import org.example.dto.request.WorkflowUpdateRequest;
-import org.example.model.DocumentDetails;
 import org.example.model.EkycDocument;
 import org.example.model.PanDocument;
 import org.example.model.SalaryDocument;
@@ -20,7 +17,6 @@ import org.example.model.VkycDocument;
 import org.example.model.entites.DocumentEntity;
 import org.example.model.entites.WorkflowEntity;
 import org.example.vegapay.VegapayWorkflowState;
-import org.example.vegapay.VegapayWorkflowStateStatus;
 import org.example.vegapay.client.VegapayClient;
 import org.example.vegapay.response.VegapayGeneralResponse;
 import org.example.vegapay.response.VegapayStatusResponse;
@@ -35,18 +31,21 @@ public class WorkflowStateHandlers {
     WorkflowTransitionService workflowTransitionService;
     VegapayStateHandler vegapayStateHandler;
     VegapayClient vegapayClient;
+    private final VegapayProgressionService vegapayProgressionService;
 
     public WorkflowStateHandlers(
             WorkflowMockRepository workflowMockRepository,
             DocumentMockRepository documentMockRepository,
             WorkflowTransitionService workflowTransitionService,
             VegapayStateHandler vegapayStateHandler,
-            VegapayClient vegapayClient) {
+            VegapayClient vegapayClient,
+            VegapayProgressionService vegapayProgressionService) {
         this.workflowMockRepository = workflowMockRepository;
         this.documentMockRepository = documentMockRepository;
         this.workflowTransitionService = workflowTransitionService;
         this.vegapayStateHandler = vegapayStateHandler;
         this.vegapayClient = vegapayClient;
+        this.vegapayProgressionService = vegapayProgressionService;
     }
 
     public void handlePanValidation(WorkflowUpdateRequest updateRequest, WorkflowEntity workflow) {
@@ -93,25 +92,9 @@ public class WorkflowStateHandlers {
     }
 
     public void handlePanValidationPending(WorkflowUpdateRequest updateRequest, WorkflowEntity workflow) {
-
-        VegapayStatusResponse vegapayStatusResponse = vegapayClient.getStatus(updateRequest.getApplicationId());
-
-        if (vegapayStatusResponse.getVegapayWorkflowState() == VegapayWorkflowState.Application_Rejected) {
-            workflow.setWorkflowState(WorkflowState.REJECTED);
-            workflowMockRepository.save(workflow);
-            return;
-        }
-
-        if (vegapayStatusResponse.getVegapayWorkflowState() == VegapayWorkflowState.Ekyc_Url_Generated
-                && vegapayStatusResponse.getVegapayWorkflowStateStatus() == VegapayWorkflowStateStatus.PNEDING) {
-            vegapayStateHandler.handleEkyc_Url_Generated(updateRequest.getApplicationId(),
-                    updateRequest.getWorkflowId());
-            WorkflowState nextState = WorkflowTransitionService.transitionTo(updateRequest.getWorkflowState(),
-                    WorkflowState.EKYC);
-            workflow.setWorkflowState(nextState);
-            workflowMockRepository.save(workflow);
-        }
-
+        vegapayProgressionService.pollVegapay(VegapayWorkflowState.Ekyc_Url_Generated,
+                workflow.getWorkflowId(),
+                workflow.getApplicationId());
     }
 
     public void handleEkyc(WorkflowUpdateRequest updateRequest, WorkflowEntity workflowEntity) {
@@ -150,46 +133,9 @@ public class WorkflowStateHandlers {
     }
 
     public void handleEkycPending(WorkflowUpdateRequest updateRequest, WorkflowEntity workflowEntity) {
-        VegapayStatusResponse vegapayStatusResponse = vegapayClient.getStatus(updateRequest.getApplicationId());
-
-        if (vegapayStatusResponse.getVegapayWorkflowState() == VegapayWorkflowState.Application_Rejected) {
-            workflowEntity.setWorkflowState(WorkflowState.REJECTED);
-            workflowMockRepository.save(workflowEntity);
-            return;
-        }
-
-        if (vegapayStatusResponse.getVegapayWorkflowState() == VegapayWorkflowState.Permanent_Address_Details
-                && vegapayStatusResponse.getVegapayWorkflowStateStatus() == VegapayWorkflowStateStatus.PNEDING) {
-            vegapayStateHandler.handlePermanentAddress(updateRequest.getApplicationId(),
-                    updateRequest.getWorkflowId());
-            return;
-        }
-
-        if (vegapayStatusResponse.getVegapayWorkflowState() == VegapayWorkflowState.Current_Address_Details
-                && vegapayStatusResponse.getVegapayWorkflowStateStatus() == VegapayWorkflowStateStatus.PNEDING) {
-            vegapayStateHandler.handleCurrent_address(updateRequest.getApplicationId(),
-                    updateRequest.getWorkflowId());
-            return;
-        }
-
-        if (vegapayStatusResponse.getVegapayWorkflowState() == VegapayWorkflowState.Ekyc_Verification
-                && vegapayStatusResponse.getVegapayWorkflowStateStatus() == VegapayWorkflowStateStatus.PNEDING) {
-
-            vegapayStateHandler.handleEkyc_Verification(updateRequest.getApplicationId(),
-                    updateRequest.getWorkflowId());
-            return;
-        }
-
-        if (vegapayStatusResponse.getVegapayWorkflowState() == VegapayWorkflowState.Vkyc
-                && vegapayStatusResponse.getVegapayWorkflowStateStatus() == VegapayWorkflowStateStatus.PNEDING) {
-            vegapayStateHandler.handleVkyc(updateRequest.getApplicationId(), updateRequest.getWorkflowId());
-            WorkflowState nextState = WorkflowTransitionService.transitionTo(updateRequest.getWorkflowState(),
-                    WorkflowState.VKYC);
-            workflowEntity.setWorkflowState(nextState);
-            workflowMockRepository.save(workflowEntity);
-            return;
-        }
-
+        vegapayProgressionService.pollVegapay(VegapayWorkflowState.Vkyc,
+                workflowEntity.getWorkflowId(),
+                workflowEntity.getApplicationId());
     }
 
     public void handleVkyc(WorkflowUpdateRequest updateRequest, WorkflowEntity workflowEntity) {
@@ -226,22 +172,9 @@ public class WorkflowStateHandlers {
     }
 
     public void handleVkycPending(WorkflowUpdateRequest updateRequest, WorkflowEntity workflowEntity) {
-        VegapayStatusResponse vegapayStatusResponse = vegapayClient.getStatus(updateRequest.getApplicationId());
-
-        if (vegapayStatusResponse.getVegapayWorkflowState() == VegapayWorkflowState.Application_Rejected) {
-            workflowEntity.setWorkflowState(WorkflowState.REJECTED);
-            workflowMockRepository.save(workflowEntity);
-            return;
-        }
-
-        if (vegapayStatusResponse.getVegapayWorkflowState() == VegapayWorkflowState.Limit_Generate
-                && vegapayStatusResponse.getVegapayWorkflowStateStatus() == VegapayWorkflowStateStatus.PNEDING) {
-            WorkflowState nextState = WorkflowTransitionService.transitionTo(updateRequest.getWorkflowState(),
-                    WorkflowState.LIMIT_CREATION);
-            workflowEntity.setWorkflowState(nextState);
-            workflowMockRepository.save(workflowEntity);
-            return;
-        }
+        vegapayProgressionService.pollVegapay(VegapayWorkflowState.Limit_Generate,
+                workflowEntity.getWorkflowId(),
+                workflowEntity.getApplicationId());
     }
 
     public void handleLimitCreation(WorkflowUpdateRequest updateRequest, WorkflowEntity workflowEntity) {
@@ -262,10 +195,10 @@ public class WorkflowStateHandlers {
 
         SalaryDocument salaryDocument = (SalaryDocument) updateRequest.getWorkflowStateRequestPayload();
 
-        vegapayStateHandler.handleLimit_Generate(updateRequest.getApplicationId(), updateRequest.getWorkflowId());
-
         documentEntity.setDocumentDetails(salaryDocument);
         documentMockRepository.save(documentEntity);
+
+        vegapayStateHandler.handleLimit_Generate(updateRequest.getApplicationId(), updateRequest.getWorkflowId());
 
         WorkflowState nextState = WorkflowTransitionService.transitionTo(updateRequest.getWorkflowState(),
                 WorkflowState.LIMIT_CREATION_PENDING);
@@ -276,22 +209,9 @@ public class WorkflowStateHandlers {
     }
 
     public void handleLimitCreationPending(WorkflowUpdateRequest updateRequest, WorkflowEntity workflowEntity) {
-        VegapayStatusResponse vegapayStatusResponse = vegapayClient.getStatus(updateRequest.getApplicationId());
-
-        if (vegapayStatusResponse.getVegapayWorkflowState() == VegapayWorkflowState.Application_Rejected) {
-            workflowEntity.setWorkflowState(WorkflowState.REJECTED);
-            workflowMockRepository.save(workflowEntity);
-            return;
-        }
-
-        if (vegapayStatusResponse.getVegapayWorkflowState() == VegapayWorkflowState.Offer_Generated
-                && vegapayStatusResponse.getVegapayWorkflowStateStatus() == VegapayWorkflowStateStatus.PNEDING) {
-            WorkflowState nextState = WorkflowTransitionService.transitionTo(updateRequest.getWorkflowState(),
-                    WorkflowState.OFFER_GENERATED);
-            workflowEntity.setWorkflowState(nextState);
-            workflowMockRepository.save(workflowEntity);
-            return;
-        }
+        vegapayProgressionService.pollVegapay(VegapayWorkflowState.Offer_Generated,
+                workflowEntity.getWorkflowId(),
+                workflowEntity.getApplicationId());
     }
 
 }
