@@ -339,7 +339,7 @@ A lock prevents overlapping well-behaved owners while its lease is valid. It doe
 
 The reported action limit is **five calls per hour per user per action API**. Model a rolling window; the historical window implementation was not established. Key by stable user/customer identity and action API, not just workflowId. A new workflow must not reset the same user's allowance. Technical retries and corrected inputs consume action calls too.
 
-The vendor status GET has no reported API-specific limit. Frontend pending updates can each obtain a fresh status. Workers add an explicitly paced background trigger in design 2; redundant serialized reads are an accepted primary-design cost. A workflow lock does not throttle reads or replace action admission at the common outbound gateway.
+The vendor status GET has no reported API-specific limit. Frontend pending updates can each obtain a fresh status. Workers add an explicitly paced background trigger in design 2; redundant serialized reads are an accepted primary-design cost. A workflow lock does not throttle reads or replace action admission at the common outbound gateway. IMPORTANT
 
 | Situation | Baseline or modeled recovery explanation |
 |---|---|

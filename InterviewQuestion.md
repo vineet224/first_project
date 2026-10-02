@@ -287,7 +287,7 @@ Your interview description can be:
 
 Describe the workers and generalized recovery as proposed unless they were part of your actual production work.
 
-This is another question where i asked what is to explain if we don't explain the hybrid sync layer
+> **This is another question where i asked what is to explain if we don't explain the hybrid sync layer**
 
 I’ll check what your orchestrator actually owns, then separate what you can defend from what the interviewer is right about. The strongest answer will use concrete behavior and failure cases from your code.
 
@@ -375,3 +375,18 @@ Platform-level evidence would be something multiple integrations or journeys act
 If your real work included the general onboarding, multi-bank eligibility or bank-handoff architecture described in `ProjectDetails.md`, discuss your concrete contribution there separately. Otherwise, this may simply be a narrower example than that interview requires.
 
 The strongest defense is **a precise ownership boundary, one difficult failure scenario, and an implemented decision with a measurable effect**. If your contribution was mainly straightforward integration, acknowledge that scope and choose another project to demonstrate deeper platform engineering.
+
+> This is the question what was you sync layer doing
+
+It was basically managing three types of syncing
+- failed status for the vegapay workflow state, other type of fail is vegapay api only fails and still in pending here the rate limit comes
+- vegapay state begin moved ahead , or we lost response for the vegapay call and doesn't saved data at our end or do not make the state transition
+- hybrid polling
+- all three type of updaters frontend polling, vkyc webhook and the worker
+- Each synchronization step checks current status before selecting an action
+
+> How we handle the out of order webhooks for vkyc state updates
+- it would be same out of order get status response like when webserver and frontend poll execute at same time and only one get the lock 
+- No speculative PAN_VALIDATION_PENDING -> PAN_VALIDATION transition is added.
+- The only reason we are able to execute one step in the user input api is because the next state for all input states are strict pending only  other wise if there would be case where after input state we have to show it's result directly and get acceptance from user then some pending state, or in short two input state consecutively
+-  A full accepted/in-flight/unknown operation ledger is optional; it is not needed to implement the state-gated primary path. Shared nextSyncAt and resume markers are optional metadata described later.

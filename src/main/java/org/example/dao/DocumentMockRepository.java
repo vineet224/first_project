@@ -34,16 +34,6 @@ public class DocumentMockRepository {
         return Optional.ofNullable(stateMap.get(state));
     }
 
-    public Optional<String> findDocumentIdByWorkflowIdAndState(String workflowId, WorkflowState state) {
-        return findByWorkflowIdAndState(workflowId, state)
-                .map(DocumentEntity::getDocumentId);
-    }
-
-    public Optional<DocumentDetails> findDocumentDetailsByWorkflowIdAndState(String workflowId, WorkflowState state) {
-        return findByWorkflowIdAndState(workflowId, state)
-                .map(DocumentEntity::getDocumentDetails);
-    }
-
     public <T extends DocumentDetails> Optional<T> findDocumentDetailsByWorkflowIdAndState(
             String workflowId,
             WorkflowState state,
